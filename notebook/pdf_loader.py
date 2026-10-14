@@ -33,6 +33,7 @@ def bprint(data):
 
 import os
 from pathlib import Path
+import hashlib
 from langchain_community.document_loaders import DirectoryLoader
 from langchain_community.document_loaders import PyMuPDFLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -151,3 +152,185 @@ class EmbeddingManager:
 
 # initialise the embedding manager
 embedding_manager = EmbeddingManager()
+
+
+class VectorStore:
+    """Manages document embeddings in a ChromaDB vector store"""
+
+    def __init__(self, collection_name: str = "pdf_documents", persist_directory: str = "./data/vector_store"):
+        """
+        Initialise the vector store
+
+        Args
+            collection_name: Name of the ChromaDB collection
+            persist_directory: Directory to persist the vector store
+        """
+        self.collection_name = collection_name
+        self.persist_directory = persist_directory
+        self.client = None
+        self.collection = None
+        self._initialize_store()
+
+    def _initialize_store(self):
+        """Initialise ChromaDB client and collection"""
+        try:
+            # Create a persistant ChromaDB client
+            os.makedirs(self.persist_directory, exist_ok=True)
+            self.client = chromadb.PersistentClient(path=self.persist_directory)
+
+            # Get or Create collection
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"description": "PDF document embedding for RAG"}
+            )
+            print(f"Vector stor initialised. Collection: {self.collection_name}")
+            print(f"Existing documents in collection: {self.client.count_collections()}")
+        except Exception as e:
+            print(f"Error initialising vector store: {e}")
+            raise
+
+    def add_document(self, documents: List[Any], embeddings: np.ndarray):
+        """
+        Add documents and their embeddings to the vector store
+
+        Args:
+            documents: List of LangChain documents
+            embeddings: Corresponding embeddings for the documents
+        """
+        if len(documents) != len(embeddings):
+            raise ValueError("Number of documents is not equal to embeddings")
+
+        print(f"Adding {len(documents)} documents to vector store...")
+
+        # prepare data for ChromaDB
+        ids = []
+        metadatas = []
+        document_text = []
+        embedding_list = []
+
+        for i, (doc, embedding) in enumerate(zip(documents, embeddings)):
+            # Generate a deterministic ID based on source file name and chunk index
+            source_file = doc.metadata.get('source_file', 'unknown')
+            raw_id = f"{source_file}_chunk_{i}"
+            doc_id = f"doc_{hashlib.md5(raw_id.encode('utf-8')).hexdigest()[:8]}_{i}"
+            ids.append(doc_id)
+
+            # prepare metadata
+            metadata = dict(doc.metadata)
+            metadata['doc_index'] = i
+            metadata['content_length'] = len(doc.page_content)
+            metadatas.append(metadata)
+
+            # document contents
+            document_text.append(doc.page_content)
+
+            # embedding
+            embedding_list.append(embedding.tolist())
+
+        # add to collection
+        try:
+            self.collection.add(
+                ids = ids,
+                embeddings=embedding_list,
+                metadatas=metadatas,
+                documents=document_text
+            )
+            print(f"Successfully added {len(documents)} documents to vector store")
+            print(f"Total ducments in collections: {self.collection.count()}")
+        
+        except Exception as e:
+            print(f"Error adding documents to vector store: {e}")
+
+
+# initialise the vector store
+vector_store = VectorStore()
+
+
+## Convert the text to embeddings
+texts = [doc.page_content for doc in chunks]
+
+## generate the embeddings
+embeddings = embedding_manager.genrate_embeddings(texts=texts)
+
+## store into the vector database
+vector_store.add_document(chunks, embeddings)
+
+
+### Retriver Pipeline from VectorStore
+
+class RagRetriever:
+    """Handles query-based retrieval from the vector store"""
+
+    def __init__(self, vector_store: VectorStore, embedding_manager: EmbeddingManager):
+        """
+        Initialise the retriever
+
+        Args:
+            vector_store: Vector store containing document embeddings
+            embedding_manager: Manager for generating query embeddings
+        """
+        self.vector_store = vector_store
+        self.embedding_manager = embedding_manager
+
+    def retrieve(self, query: str, top_k: int = 5, score_threshold: float = 0.0) -> List[dict[str, Any]]:
+        """
+        Retrieve relevant documents for a query
+
+        Args:
+            query: The search query
+            top_k: Number of results to return
+            score_threshold: Minimum similarity score threshold
+
+        Returns:
+            List of directories containing retrieved documents and metadata
+        """
+        print(f"Retrieving documents for query: '{query}'")
+        print(f"Top K = {top_k}, score threshold: {score_threshold }")
+
+        # Generate query embeddings
+        query_embeddings = self.embedding_manager.genrate_embeddings([query])[0]
+
+        # Search in vector store
+        try:
+            results = self.vector_store.collection.query(
+                query_embeddings=[query_embeddings.tolist()],
+                n_results=top_k
+            )
+
+            retrieved_docs = []
+
+            if results['documents'] and results['documents'][0]:
+                documents = results["documents"][0]
+                metadatas = results["metadatas"][0]
+                distances = results["distances"][0]
+                ids = results["ids"][0]
+
+                for i, (doc_id, document, metadata, distance) in enumerate(zip(ids, documents, metadatas, distances)):
+                    # Convert distance to similarity score (ChromaDB uses cosine distance)
+                    similarity_score = 1- distance
+
+                    if similarity_score >= score_threshold:
+                        retrieved_docs.append({
+                            'id': doc_id,
+                            'content': document,
+                            'metadata': metadata,
+                            'similarity_score': similarity_score,
+                            'distance': distance,
+                            'rank': i+1
+                        })
+                print(f"Retrieved {len(retrieved_docs)} documents (after filtering)")
+            else:
+                print("No documents found")
+            return retrieved_docs
+
+        except Exception as e:
+            print(f"Error during retrieval: {e}")
+            return []
+
+
+# initialise the rag retriever
+rag_retriever = RagRetriever(vector_store, embedding_manager)
+while True:
+    query = input("Enter query: ")
+    r = rag_retriever.retrieve(query)
+    bprint(r)
